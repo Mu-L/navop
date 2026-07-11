@@ -338,12 +338,26 @@
 - **验证方式**：运行对应状态 contract 测试、fake HTTP 网络测试、真实 GPUI view 测试，以及相关 crate 的 `cargo check` / `cargo clippy -D warnings` / `cargo test`。
 - **适用范围**：`main/src/settings/*`、扩展市场加载、更新检查、数据库驱动安装等 GPUI UI 层异步加载路径。
 
+- **标题**：GPUI `background_spawn` 不得直接轮询依赖 Tokio runtime 的数据库 Future
+- **触发信号**：macOS 上执行 SQL 转储、表导入或表导出时，在 `tokio::time::timeout`、数据库连接初始化或 Tokio socket/timer 路径出现“没有 reactor/runtime”类 panic，随后因 panic 穿过 GPUI 的 `extern "C"` 回调边界而触发 `SIGABRT`。
+- **根因 / 约束**：GPUI `background_spawn` 使用 GPUI background executor，不会自动进入应用的 Tokio runtime；数据库 Future 即使表面只是 `async`，其连接驱动通常依赖 Tokio timer、reactor 或 socket。上述“纯 HTTP/IO 优先使用 `cx.background_spawn`”的经验不适用于这类 Tokio-bound Future。
+- **正确做法**：由拥有数据库操作的状态层统一通过 `one_core::gpui_tokio::Tokio::spawn_result` 创建任务，并向 View 返回 GPUI `Task`；运行时绑定的核心方法保持私有，并在入口使用 `tokio::runtime::Handle::try_current()` 做防御性校验。View 只负责进度 channel、文件写入和 UI 更新，不自行选择数据库 Future 的 executor。
+- **验证方式**：覆盖 Tokio runtime 内外的 contract 测试；用结构回归测试保证受影响 View 不出现 `background_spawn` 或危险的 direct/sync API；运行相关 `db`、`db_view` 测试和 `main` 编译检查，并确认崩溃栈不再从 GPUI background executor 进入数据库连接初始化。
+- **适用范围**：`crates/db/src/manager.rs`、`crates/db_view/src/import_export/*`，以及任何会调用 Tokio timer、socket、数据库驱动或 Tokio channel 的 GPUI 后台任务。
+
 - **标题**：GPUI `overflow_y_scrollbar()` 不要直接承担父级 flex 裁剪职责
 - **触发信号**：窗口或面板里已经调用 `.overflow_y_scrollbar()`，但列表/卡片区域仍无法上下滚动，尤其是该区域同时需要 `.flex_1()`、`.min_h_0()` 或 `.min_w_0()` 参与父级布局。
 - **根因 / 约束**：`gpui_component::scroll::ScrollableElement::overflow_y_scrollbar()` 会生成额外的 `Scrollable` 外层 wrapper；该 wrapper 渲染时主要继承原元素的 `size`，不能假设原元素上的 flex/min 尺寸约束会作为父级布局约束稳定作用到外层滚动盒。
 - **正确做法**：用普通外层容器承担父级布局与裁剪，例如 `.flex_1().h_full().min_h_0().min_w_0().overflow_hidden()`；把真正可滚动内容放到内层 `.size_full().overflow_y_scrollbar()` 中。若父级使用 `h_flex()`，注意它默认 `items_center()`，外层滚动边界通常必须显式 `.h_full()` 或其他明确高度，否则内层 `size_full()` 可能塌陷成白屏。参考 `main/src/new_connection/connection_window.rs::render_card_area`。
 - **验证方式**：补结构性回归测试，断言外层有 flex/h_full/min/overflow_hidden 边界、内层有 size_full/overflow_y_scrollbar；运行相关 UI 模块的定向 `cargo test`，必要时手工打开窗口验证滚轮。
 - **适用范围**：GPUI popup、dialog、tab 面板中需要滚动的列表、卡片网格、表单内容区域。
+
+- **标题**：可见终端执行不能用 EOF 绑定 Agent 取消与命令完成
+- **触发信号**：`terminal.exec` 执行 `command &`、`npm run dev &` 或 `nohup command &` 后一直 pending；点击 Agent 的 × 后对话仍显示运行中；或取消 Agent 时误向终端发送 Ctrl+C、终止仍在运行的命令。
+- **根因 / 约束**：后台进程会继承 PTY/stdout/stderr，shell leader 退出不代表 reader 能收到 EOF。Agent turn、tool waiter 与终端命令若共用同一个 future，进程或 FD 清理就会反向阻塞对话终态。可见终端命令由用户终端拥有，Agent 取消无权终止它。
+- **正确做法**：用 OSC 133 supervisor 独立管理 readiness、safe-replace、命令 epoch、observer 与 timeout。只有 `Ready` 才能发送 ETX，收到 fresh `InputStart` 后再提交命令；提交动作必须立即把 readiness 悲观切到 `SubmissionPending`，即使 `wait_for_output=false`。命令完成以 `CommandFinished` 或新 prompt epoch 为边界，不依赖 EOF。取消前未开始的调用零写入；提交后的取消只 detach waiter，后台 supervisor 继续有界清理，并停止缓存无人消费的输出。Agent turn 同时立即发出 `TurnCancelled`，旧 turn 的迟到写入按 turn id 丢弃。
+- **验证方式**：覆盖 busy/unknown 零写入、半行输入清理、fresh prompt 握手、`wait_for_output=false` 立即 busy、预取消不排队、取消后不发送控制字符、detached output 不增长、background/nohup 不等 EOF、旧 turn 不清理或污染新 turn；再运行 terminal/tool-runtime/agent-runtime/UI 的定向测试、check 与 clippy。
+- **适用范围**：`crates/terminal/src/exec_supervisor/*`、SSH terminal actor、`terminal.exec` Public MCP/Agent adapter、`agent_runtime` turn cancellation 与 `ai_chat_view` 终态处理。
 
 ### 执行原则
 
