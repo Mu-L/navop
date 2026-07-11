@@ -1,0 +1,4 @@
+interface:
+  display_name: "同步 OnetCli 上游"
+  short_description: "安全同步 OnetCli dev 变更并保留 Navop 品牌契约"
+  default_prompt: "使用 $syncing-onetcli-upstream 将 OnetCli dev 的最新修改同步到 Navop。"
