@@ -1,5 +1,5 @@
 use anyhow::Result;
-use gpui::{Context, EntityInputHandler, Task, Window};
+use gpui::{App, Context, EntityInputHandler, Task, Window};
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionResponse, InlineCompletionContext,
     InlineCompletionItem, InlineCompletionResponse, InlineCompletionTriggerKind, InsertTextFormat,
@@ -26,7 +26,7 @@ enum CompletionMenuAction {
 fn completion_menu_action(
     has_active_menu: bool,
     is_trigger: bool,
-    full_text: &str,
+    document_is_blank: bool,
     new_offset: usize,
     start_offset: usize,
 ) -> CompletionMenuAction {
@@ -42,7 +42,7 @@ fn completion_menu_action(
         return CompletionMenuAction::Ignore;
     }
 
-    if has_active_menu && full_text.trim().is_empty() {
+    if has_active_menu && document_is_blank {
         return CompletionMenuAction::Hide;
     }
 
@@ -192,10 +192,11 @@ impl InputState {
             .as_ref()
             .and_then(|menu| menu.read(cx).trigger_start_offset)
             .unwrap_or(start);
+        let document_is_blank = active_menu.is_some() && self.text.chars().all(char::is_whitespace);
         let action = completion_menu_action(
             active_menu.is_some(),
             is_trigger,
-            &self.text.to_string(),
+            document_is_blank,
             new_offset,
             start_offset,
         );
@@ -246,6 +247,8 @@ impl InputState {
             trigger_character: Some(query.clone()),
         };
 
+        let completion_request_id = self.next_completion_request_id();
+        let document_revision = self.document_revision;
         let provider_responses =
             provider.completions(&self.text, new_offset, completion_context, window, cx);
         self._context_menu_task = cx.spawn_in(window, async move |editor, cx| {
@@ -260,6 +263,19 @@ impl InputState {
             if completions.is_empty() {
                 editor
                     .update_in(cx, |editor, window, cx| {
+                        if !editor.completion_request_is_current(
+                            completion_request_id,
+                            document_revision,
+                            new_offset,
+                            start_offset,
+                            &query,
+                            &menu,
+                            window,
+                            cx,
+                        ) {
+                            return;
+                        }
+
                         if editor.cursor() != new_offset
                             || editor
                                 .text_for_range(
@@ -290,19 +306,16 @@ impl InputState {
 
             editor
                 .update_in(cx, |editor, window, cx| {
-                    if !editor.focus_handle.is_focused(window)
-                        || editor.cursor() != new_offset
-                        || editor
-                            .text_for_range(
-                                editor.range_to_utf16(&(start_offset..new_offset)),
-                                &mut None,
-                                window,
-                                cx,
-                            )
-                            .map(|text| text.trim() != query)
-                            .unwrap_or(true)
-                        || !editor.is_active_completion_menu(&menu, start_offset, cx)
-                    {
+                    if !editor.completion_request_is_current(
+                        completion_request_id,
+                        document_revision,
+                        new_offset,
+                        start_offset,
+                        &query,
+                        &menu,
+                        window,
+                        cx,
+                    ) {
                         return;
                     }
 
@@ -316,6 +329,48 @@ impl InputState {
 
             Ok(())
         });
+    }
+
+    fn next_completion_request_id(&mut self) -> u64 {
+        self.completion_epoch = self.completion_epoch.saturating_add(1);
+        self.completion_epoch
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn completion_request_is_current(
+        &self,
+        request_id: u64,
+        document_revision: u64,
+        cursor: usize,
+        start_offset: usize,
+        query: &str,
+        expected_menu: &gpui::Entity<CompletionMenu>,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        self.completion_epoch == request_id
+            && self.document_revision == document_revision
+            && self.cursor() == cursor
+            && !self.has_ime_marked_text()
+            && self.focus_handle.is_focused(window)
+            && self.is_active_completion_menu(expected_menu, start_offset, cx)
+            && self.text.slice(start_offset..cursor).to_string().trim() == query
+    }
+
+    fn inline_completion_request_is_current(
+        &self,
+        request_id: u64,
+        document_revision: u64,
+        cursor: usize,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        self.completion_epoch == request_id
+            && self.document_revision == document_revision
+            && self.cursor() == cursor
+            && !self.has_ime_marked_text()
+            && !self.is_context_menu_open(cx)
+            && self.focus_handle.is_focused(window)
     }
 
     fn is_active_completion_menu(
@@ -348,6 +403,8 @@ impl InputState {
 
         let offset = self.cursor();
         let text = self.text.clone();
+        let completion_request_id = self.next_completion_request_id();
+        let document_revision = self.document_revision;
         let debounce = provider.inline_completion_debounce();
         let background_executor = cx.background_executor().clone();
 
@@ -357,8 +414,14 @@ impl InputState {
 
             // Now fetch the inline completion after the debounce period
             let task = editor.update_in(cx, |editor, window, cx| {
-                // Check if cursor has moved during debounce
-                if editor.cursor() != offset {
+                // Check if cursor, document, or completion context changed during debounce.
+                if !editor.inline_completion_request_is_current(
+                    completion_request_id,
+                    document_revision,
+                    offset,
+                    window,
+                    cx,
+                ) {
                     return None;
                 }
 
@@ -382,8 +445,13 @@ impl InputState {
             let response = task.await?;
 
             editor.update_in(cx, |editor, _window, cx| {
-                // Only apply if cursor still hasn't moved
-                if editor.cursor() != offset {
+                if !editor.inline_completion_request_is_current(
+                    completion_request_id,
+                    document_revision,
+                    offset,
+                    _window,
+                    cx,
+                ) {
                     return;
                 }
 
@@ -444,11 +512,11 @@ mod tests {
     #[test]
     fn ignores_non_trigger_without_existing_menu() {
         assert_eq!(
-            completion_menu_action(false, false, "name", 4, 0),
+            completion_menu_action(false, false, false, 4, 0),
             CompletionMenuAction::Ignore
         );
         assert_eq!(
-            completion_menu_action(false, false, "@中1", 5, 4),
+            completion_menu_action(false, false, false, 5, 4),
             CompletionMenuAction::Ignore
         );
     }
@@ -456,11 +524,11 @@ mod tests {
     #[test]
     fn hides_existing_menu_when_text_becomes_empty() {
         assert_eq!(
-            completion_menu_action(true, false, "", 0, 0),
+            completion_menu_action(true, false, true, 0, 0),
             CompletionMenuAction::Hide
         );
         assert_eq!(
-            completion_menu_action(true, false, "   ", 0, 0),
+            completion_menu_action(true, false, true, 0, 0),
             CompletionMenuAction::Hide
         );
     }
@@ -468,7 +536,7 @@ mod tests {
     #[test]
     fn hides_existing_menu_when_cursor_moves_before_trigger_start() {
         assert_eq!(
-            completion_menu_action(true, false, "na", 0, 1),
+            completion_menu_action(true, false, false, 0, 1),
             CompletionMenuAction::Hide
         );
     }
@@ -476,7 +544,7 @@ mod tests {
     #[test]
     fn ignores_trigger_without_existing_menu_when_cursor_is_before_trigger_start() {
         assert_eq!(
-            completion_menu_action(false, true, "n", 1, 3),
+            completion_menu_action(false, true, false, 1, 3),
             CompletionMenuAction::Ignore
         );
     }
@@ -484,7 +552,7 @@ mod tests {
     #[test]
     fn refreshes_existing_menu_on_delete_when_text_still_has_context() {
         assert_eq!(
-            completion_menu_action(true, false, "n", 1, 0),
+            completion_menu_action(true, false, false, 1, 0),
             CompletionMenuAction::Refresh(CompletionTriggerKind::INVOKED)
         );
     }
@@ -492,11 +560,11 @@ mod tests {
     #[test]
     fn refreshes_active_menu_for_cjk_and_numeric_query_updates() {
         assert_eq!(
-            completion_menu_action(true, false, "@中", 4, 0),
+            completion_menu_action(true, false, false, 4, 0),
             CompletionMenuAction::Refresh(CompletionTriggerKind::INVOKED)
         );
         assert_eq!(
-            completion_menu_action(true, false, "@中1", 5, 0),
+            completion_menu_action(true, false, false, 5, 0),
             CompletionMenuAction::Refresh(CompletionTriggerKind::INVOKED)
         );
     }
@@ -504,7 +572,7 @@ mod tests {
     #[test]
     fn refreshes_with_trigger_character_for_normal_typing() {
         assert_eq!(
-            completion_menu_action(false, true, "na", 2, 2),
+            completion_menu_action(false, true, false, 2, 2),
             CompletionMenuAction::Refresh(CompletionTriggerKind::TRIGGER_CHARACTER)
         );
     }

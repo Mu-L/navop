@@ -10,12 +10,14 @@ mod completions;
 mod definitions;
 mod document_colors;
 mod hover;
+mod signature_help;
 
 pub use code_actions::*;
 pub use completions::*;
 pub use definitions::*;
 pub use document_colors::*;
 pub use hover::*;
+pub use signature_help::*;
 
 /// LSP ServerCapabilities
 ///
@@ -31,10 +33,15 @@ pub struct Lsp {
     pub definition_provider: Option<Rc<dyn DefinitionProvider>>,
     /// The document color provider.
     pub document_color_provider: Option<Rc<dyn DocumentColorProvider>>,
+    /// The signature help provider.
+    pub signature_help_provider: Option<Rc<dyn SignatureHelpProvider>>,
 
     document_colors: Vec<(lsp_types::Range, Hsla)>,
+    hover_generation: u64,
+    signature_help_generation: u64,
     _hover_task: Task<Result<()>>,
     _document_color_task: Task<()>,
+    _signature_help_task: Task<()>,
 }
 
 impl Default for Lsp {
@@ -45,9 +52,13 @@ impl Default for Lsp {
             hover_provider: None,
             definition_provider: None,
             document_color_provider: None,
+            signature_help_provider: None,
             document_colors: vec![],
+            hover_generation: 0,
+            signature_help_generation: 0,
             _hover_task: Task::ready(Ok(())),
             _document_color_task: Task::ready(()),
+            _signature_help_task: Task::ready(()),
         }
     }
 }
@@ -66,18 +77,33 @@ impl Lsp {
     /// Reset all LSP states.
     pub(crate) fn reset(&mut self) {
         self.document_colors.clear();
-        self._hover_task = Task::ready(Ok(()));
+        self.invalidate_hover();
+        self.invalidate_signature_help();
         self._document_color_task = Task::ready(());
+    }
+
+    fn next_hover_generation(&mut self) -> u64 {
+        self.hover_generation = self.hover_generation.saturating_add(1);
+        self.hover_generation
+    }
+
+    pub(crate) fn invalidate_hover(&mut self) {
+        self.hover_generation = self.hover_generation.saturating_add(1);
+        self._hover_task = Task::ready(Ok(()));
+    }
+
+    fn next_signature_help_generation(&mut self) -> u64 {
+        self.signature_help_generation = self.signature_help_generation.saturating_add(1);
+        self.signature_help_generation
+    }
+
+    pub(crate) fn invalidate_signature_help(&mut self) {
+        self.signature_help_generation = self.signature_help_generation.saturating_add(1);
+        self._signature_help_task = Task::ready(());
     }
 }
 
 impl InputState {
-    pub(crate) fn hide_context_menu(&mut self, cx: &mut Context<Self>) {
-        self.context_menu_content = None;
-        self._context_menu_task = Task::ready(Ok(()));
-        cx.notify();
-    }
-
     pub fn is_context_menu_open(&self, cx: &App) -> bool {
         let Some(menu) = self.context_menu_content.as_ref() else {
             return false;
@@ -150,10 +176,18 @@ impl InputState {
         cx.notify();
     }
 
-    pub(crate) fn clear_hover_state(&mut self, cx: &mut Context<InputState>) {
+    /// Invalidate the current hover UI and any in-flight hover request.
+    ///
+    /// Metadata consumers can use this when the editor's semantic context
+    /// changes without changing the document text.
+    pub fn invalidate_hover(&mut self, cx: &mut Context<InputState>) {
         self.hover_definition.clear();
         self.hover_popover = None;
-        self.lsp._hover_task = Task::ready(Ok(()));
+        self.lsp.invalidate_hover();
         cx.notify();
+    }
+
+    pub(crate) fn clear_hover_state(&mut self, cx: &mut Context<InputState>) {
+        self.invalidate_hover(cx);
     }
 }
